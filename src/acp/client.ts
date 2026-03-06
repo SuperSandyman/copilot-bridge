@@ -1,7 +1,5 @@
 import { createInterface } from "node:readline";
-import type { ChildProcessWithoutNullStreams } from "node:child_process";
-
-import { preflightSessionCreate, spawnCopilotProcess } from "./spawnCopilot.js";
+import { spawnCopilotProcess, type SpawnedCopilotProcess } from "./spawnCopilot.js";
 import { SessionAccumulator } from "./sessionAccumulator.js";
 import type {
   CopilotAskRequest,
@@ -40,7 +38,7 @@ export class CopilotAcpClient {
   private readonly logger = createLogger("acp");
   private readonly timeoutMs: number;
   private readonly maxPromptChars: number;
-  private process?: ChildProcessWithoutNullStreams;
+  private process?: SpawnedCopilotProcess;
   private stdoutReader?: ReturnType<typeof createInterface>;
   private stderrReader?: ReturnType<typeof createInterface>;
   private nextRequestId = 1;
@@ -63,18 +61,6 @@ export class CopilotAcpClient {
 
   async ask(request: CopilotAskRequest): Promise<CopilotAskResult> {
     const blocks = this.buildPromptBlocks(request);
-    const preflight = await preflightSessionCreate(this.options);
-
-    if (preflight.initializeResult) {
-      this.initializeResult = preflight.initializeResult;
-    }
-
-    if (preflight.authRequired) {
-      throw new BridgeError("AUTH_REQUIRED", "Copilot CLI requires authentication", {
-        authMethods: this.initializeResult?.authMethods ?? [],
-        stderr: preflight.stderrLines,
-      });
-    }
 
     await this.connect();
     await this.initialize();
@@ -165,19 +151,7 @@ export class CopilotAcpClient {
       return;
     }
 
-    this.process.stdin.end();
-
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(() => {
-        this.process?.kill("SIGTERM");
-        resolve();
-      }, 1_000);
-
-      this.process?.once("exit", () => {
-        clearTimeout(timer);
-        resolve();
-      });
-    });
+    await this.process.close();
   }
 
   private async connect(): Promise<void> {
@@ -185,9 +159,9 @@ export class CopilotAcpClient {
       return;
     }
 
-    this.process = spawnCopilotProcess(this.options);
+    this.process = await spawnCopilotProcess(this.options);
 
-    this.process.on("error", (error) => {
+    this.process.child.on("error", (error) => {
       const wrapped =
         error && typeof error === "object" && "code" in error && error.code === "ENOENT"
           ? new BridgeError("COPILOT_NOT_FOUND", "Copilot CLI was not found on PATH", error)
@@ -195,7 +169,7 @@ export class CopilotAcpClient {
       this.failAllPending(wrapped);
     });
 
-    this.process.on("close", (code, signal) => {
+    this.process.child.on("close", (code, signal) => {
       const error = new BridgeError(
         "COPILOT_PROCESS_EXITED",
         "Copilot process exited before the request completed",
@@ -240,13 +214,13 @@ export class CopilotAcpClient {
         return;
       }
 
-      if (this.process.pid) {
+      if (this.process.child.pid) {
         resolve();
         return;
       }
 
-      this.process.once("spawn", () => resolve());
-      this.process.once("error", reject);
+      this.process.child.once("spawn", () => resolve());
+      this.process.child.once("error", reject);
     });
   }
 

@@ -1,13 +1,24 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { createInterface } from "node:readline";
+import { spawn, type ChildProcess } from "node:child_process";
+import { createReadStream, createWriteStream, openSync, constants } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { Readable, Writable } from "node:stream";
 
 import { BridgeError } from "../utils/errors.js";
-import type { InitializeResult, SessionNewResult } from "./types.js";
 
 type SpawnOptions = {
   cwd: string;
   model?: string;
   agent?: string;
+};
+
+export type SpawnedCopilotProcess = {
+  child: ChildProcess;
+  stdin: Writable;
+  stdout: Readable;
+  stderr: Readable;
+  close: () => Promise<void>;
 };
 
 function parseExtraArgs(value: string | undefined): string[] {
@@ -23,6 +34,35 @@ function parseExtraArgs(value: string | undefined): string[] {
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\"'\"'`)}'`;
+}
+
+async function runCommand(command: string, args: string[]): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(command, args, {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+
+    let stderr = "";
+    child.stderr?.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    child.once("error", reject);
+    child.once("close", (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+
+      reject(
+        new BridgeError("COMMAND_FAILED", `${command} exited with code ${code}`, {
+          command,
+          args,
+          stderr,
+        }),
+      );
+    });
+  });
 }
 
 export function buildCopilotCommand(options: SpawnOptions): {
@@ -54,130 +94,65 @@ export function buildCopilotCommand(options: SpawnOptions): {
   return { command, args };
 }
 
-export function spawnCopilotProcess(
+export async function spawnCopilotProcess(
   options: SpawnOptions,
-): ChildProcessWithoutNullStreams {
+): Promise<SpawnedCopilotProcess> {
   const { command, args } = buildCopilotCommand(options);
+  const tempDir = await mkdtemp(join(tmpdir(), "copilot-bridge-"));
+  const stdinPath = join(tempDir, "stdin.fifo");
+  const stdoutPath = join(tempDir, "stdout.fifo");
+  const stderrPath = join(tempDir, "stderr.fifo");
 
-  try {
-    return spawn(command, args, {
-      cwd: options.cwd,
-      env: process.env,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-  } catch (error) {
-    throw new BridgeError("COPILOT_SPAWN_FAILED", "Failed to spawn Copilot CLI", {
-      command,
-      args,
-      cause: error,
-      });
-  }
-}
+  await Promise.all([
+    runCommand("mkfifo", [stdinPath]),
+    runCommand("mkfifo", [stdoutPath]),
+    runCommand("mkfifo", [stderrPath]),
+  ]);
 
-export async function preflightSessionCreate(options: SpawnOptions): Promise<{
-  initializeResult?: InitializeResult;
-  sessionNewResult?: SessionNewResult;
-  authRequired: boolean;
-  stdoutLines: string[];
-  stderrLines: string[];
-}> {
-  const { command, args } = buildCopilotCommand(options);
-  const initializePayload = JSON.stringify({
-    jsonrpc: "2.0",
-    id: 1,
-    method: "initialize",
-    params: {
-      clientInfo: { name: "copilot-bridge", version: "1.0.0" },
-      protocolVersion: 1,
-    },
-  });
-  const sessionNewPayload = JSON.stringify({
-    jsonrpc: "2.0",
-    id: 2,
-    method: "session/new",
-    params: {
-      cwd: options.cwd,
-      mcpServers: [],
-    },
+  const stdinFd = openSync(stdinPath, constants.O_RDWR);
+  const stdin = createWriteStream(stdinPath, { fd: stdinFd, autoClose: true });
+  const stdout = createReadStream(stdoutPath, { flags: "r" });
+  const stderr = createReadStream(stderrPath, { flags: "r" });
+
+  const shellCommand = `${[command, ...args].map(shellQuote).join(" ")} <${shellQuote(
+    stdinPath,
+  )} >${shellQuote(stdoutPath)} 2>${shellQuote(stderrPath)}`;
+
+  const child = spawn("/bin/sh", ["-lc", shellCommand], {
+    cwd: options.cwd,
+    env: process.env,
+    stdio: ["ignore", "ignore", "ignore"],
   });
 
-  const child = spawn(
-    "/bin/sh",
-    [
-      "-lc",
-      `printf '%s\n%s\n' "$ACP_INIT" "$ACP_SESSION_NEW" | ${[command, ...args]
-        .map(shellQuote)
-        .join(" ")}`,
-    ],
-    {
-      cwd: options.cwd,
-      env: {
-        ...process.env,
-        ACP_INIT: initializePayload,
-        ACP_SESSION_NEW: sessionNewPayload,
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-    },
-  );
-
-  const stdoutLines: string[] = [];
-  const stderrLines: string[] = [];
-
-  const stdoutReader = createInterface({ input: child.stdout });
-  stdoutReader.on("line", (line) => {
-    if (line.trim()) {
-      stdoutLines.push(line);
+  let cleanedUp = false;
+  const cleanup = async (): Promise<void> => {
+    if (cleanedUp) {
+      return;
     }
-  });
 
-  const stderrReader = createInterface({ input: child.stderr });
-  stderrReader.on("line", (line) => {
-    if (line.trim()) {
-      stderrLines.push(line);
-    }
-  });
-
-  await new Promise<void>((resolve, reject) => {
-    child.once("error", reject);
-    child.once("close", () => resolve());
-  });
-
-  stdoutReader.close();
-  stderrReader.close();
-
-  let initializeResult: InitializeResult | undefined;
-  let sessionNewResult: SessionNewResult | undefined;
-  let authRequired = false;
-
-  for (const line of stdoutLines) {
-    try {
-      const parsed = JSON.parse(line) as {
-        id?: number;
-        result?: unknown;
-        error?: { code: number; message: string };
-      };
-
-      if (parsed.id === 1 && parsed.result) {
-        initializeResult = parsed.result as InitializeResult;
-      }
-
-      if (parsed.id === 2 && parsed.result) {
-        sessionNewResult = parsed.result as SessionNewResult;
-      }
-
-      if (parsed.id === 2 && parsed.error?.message === "Authentication required") {
-        authRequired = true;
-      }
-    } catch {
-      // Ignore non-JSON lines; stderr already captures debugging context.
-    }
-  }
+    cleanedUp = true;
+    stdin.destroy();
+    stdout.destroy();
+    stderr.destroy();
+    await rm(tempDir, { recursive: true, force: true });
+  };
 
   return {
-    ...(initializeResult ? { initializeResult } : {}),
-    ...(sessionNewResult ? { sessionNewResult } : {}),
-    authRequired,
-    stdoutLines,
-    stderrLines,
+    child,
+    stdin,
+    stdout,
+    stderr,
+    async close() {
+      if (child.exitCode === null) {
+        child.kill("SIGTERM");
+      }
+
+      await new Promise<void>((resolve) => {
+        child.once("close", () => resolve());
+        setTimeout(resolve, 1_000).unref();
+      });
+
+      await cleanup();
+    },
   };
 }
