@@ -1,0 +1,28 @@
+{
+  "name": "copilot-bridge",
+  "version": "1.0.0",
+  "description": "MCP to ACP bridge for GitHub Copilot CLI",
+  "type": "module",
+  "main": "dist/server.js",
+  "bin": {
+    "copilot-bridge": "dist/server.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/server.ts",
+    "test": "node --test --import tsx src/**/*.test.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.5",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
